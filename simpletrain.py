@@ -15,6 +15,44 @@ import configs.classSets as classSets
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+from scipy.stats import mode
+
+#libraries for tca analysis
+from tayloranalysis.model_extension import extend_model
+import itertools
+
+import argparse
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "-x",
+    "--massx",
+    type=int
+)
+
+parser.add_argument(
+    "-y",
+    "--massy",
+    type=int
+)
+
+parser.add_argument(
+    "-e",
+    "--epochs",
+    type=int
+)
+
+parser.add_argument(
+    "-s",
+    "--essemble",
+    type=int
+)
+
+args = parser.parse_args()
+
+output_dir = "simpletrain_results"
+os.makedirs(output_dir, exist_ok=True)
 
 
 # List of input features that would be used for training
@@ -26,7 +64,7 @@ SAMPLES = OrderedDict([
         ],
     ),
     (
-        "ytt_hbb", 
+        "ytt_hbb",
         [
             "XToYHTo2Tau2B.root",
         ],
@@ -123,8 +161,11 @@ def load_events(samples, classes, mass_x, mass_y):
         data_frames[key] = events
     return data_frames
 
-training_dataframes = load_events(TRAIN_SAMPLES, CLASSES, 280, 125)
-test_dataframes = load_events(TEST_SAMPLES, CLASSES, 280, 125)
+mass_x = args.massx
+mass_y = args.massy
+
+training_dataframes = load_events(TRAIN_SAMPLES, CLASSES, mass_x, mass_y)
+test_dataframes = load_events(TEST_SAMPLES, CLASSES, mass_x, mass_y)
 
 def weighted_cross_entropy(pred, target, weight):
     loss = F.cross_entropy(pred, target, reduction='none')
@@ -134,15 +175,16 @@ def balance_samples(dfs):
     sum_weights_all = sum([sum(df["weight"].values) for df in dfs.values()])
     for output, df in dfs.items():
         sum_weights_class = sum(df['weight'].values)
-        df["weight"] = df["weight"] * (sum_weights_all / (len(dfs) * sum_weights_class))
+        if output in ["ybb_htt","ytt_hbb"]:
+            df["weight"] = 2*df["weight"] * (sum_weights_all / (len(dfs) * sum_weights_class))
+        else:
+            df["weight"] = df["weight"] * (sum_weights_all / (len(dfs) * sum_weights_class))
 
 
 def create_dataset(data_frames, input_features, calculate_weights=True, mode="train"):
     x, y, w, index = [], [], [], []
-    print(f"original samples:{data_frames}")
     if calculate_weights:
         balance_samples(data_frames)
-    print(f"weighted samples:{data_frames}")
     for sample, data_frame in data_frames.items():
         inputs = torch.from_numpy(data_frame[input_features].values).float()
         inputs = (inputs - torch.mean(inputs, axis=0)) / torch.std(inputs, axis=0)
@@ -222,42 +264,121 @@ def train(dataloader,model,optimizer):
         optimizer.zero_grad()
 
 
-def test(dataloader,model,show_confusion=False):
+def test(dataloader,model,show_confusion=False,do_essemble=False):
     size = len(dataloader.dataset)
     num_batches = len(dataloader)
     model.eval()
     test_loss,correct = 0,0
     all_preds = []
     all_labels = []
-    with torch.no_grad():
-        for X, y, w, index in dataloader:
-            X,y,w = X.to(device),y.to(device),w.to(device)
-            pred = model(X)
-            test_loss += weighted_cross_entropy(pred, y, w).item()
-            correct += (pred.argmax(1) == y).type(torch.float).sum().item()
+    if not do_essemble:
+        with torch.no_grad():
+                for X, y, w, index in dataloader:
+                    X,y,w = X.to(device),y.to(device),w.to(device)
+                    pred = model(X)
+                    test_loss += weighted_cross_entropy(pred, y, w).item()
+                    correct += (pred.argmax(1) == y).type(torch.float).sum().item()
 
-            all_preds.extend(torch.argmax(torch.softmax(pred, dim=1), dim=1).cpu().numpy())
-            all_labels.extend(y.cpu().numpy())
+                    all_preds.extend(torch.argmax(torch.softmax(pred, dim=1), dim=1).cpu().numpy())
+                    all_labels.extend(y.cpu().numpy())
 
-    test_loss /= num_batches
-    correct /= size
-    print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
+        test_loss /= num_batches
+        correct /= size
+        print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
+
+    else:
+        with torch.no_grad():
+            essemble_list = []
+            for i in range(do_essemble):
+                preds_one_round = []
+                for X, y, w, index in dataloader:
+                    X,y,w = X.to(device),y.to(device),w.to(device)
+                    pred = model(X)
+                    preds_one_round.extend(torch.argmax(torch.softmax(pred, dim=1), dim=1).cpu().numpy())
+                    if i == 0:
+                        all_labels.extend(y.cpu().numpy())
+            
+                    #preds_one_round = np.concatenate(preds_one_round)
+                essemble_list.append(preds_one_round)
+
+            essemble_list = np.array(essemble_list).T
+            voted_preds, _ = mode(essemble_list, axis=1)
+            voted_preds = voted_preds.flatten()
+            all_preds.extend(voted_preds)
 
     if show_confusion:
         cm = confusion_matrix(all_labels, all_preds, normalize="true")
-        disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=CLASSES)
         disp.plot(cmap="Blues")
         plt.title("Confusion Matrix")
-        plt.savefig("confusion_matrix.png", dpi=300, bbox_inches='tight')
+        plt.savefig(f"{output_dir}/confusion_matrix_x{mass_x}_y{mass_y}.png", dpi=300, bbox_inches='tight')
 
-epochs = 60
+epochs = args.epochs
 for t in range(epochs):
     print(f"Epoch {t+1}\n-------------------------------")
     train(training_dataloader, model, optimizer)
     if t == (epochs -1):
-        test(training_dataloader, model, show_confusion=True)
+        test(test_dataloader, model, show_confusion=True, do_essemble=args.essemble)
     else:
-        test(training_dataloader, model)
+        test(test_dataloader, model)
+
+
+# calculate TCA
+model_tca = extend_model(model)
+model_tca = model_tca.to(device)
+model_tca = model_tca.eval()
+
+def get_feature_combis(feature_list: list, combi_list: list):
+    feature_combinations = []
+    for combination in combi_list:
+        feature_combi = tuple(feature_list[val] for val in combination)
+        feature_combinations.append(feature_combi)
+    return feature_combinations
+
+# get the label combinations of input features
+combinations = []
+
+for i in range(len(INPUT_FEATURES)):
+    combinations.append((i,))
+
+combinations += [
+    i for i in itertools.combinations(list(range(len(INPUT_FEATURES))),2)
+]
+
+# get input features names via combinations labels 
+labels = get_feature_combis(INPUT_FEATURES, combinations)
+labels = [",".join(label) for label in labels]
+
+
+#define a dataframe for tca, columns name corresponds to each tca name
+def DataframeConstruct(combs,input,node,labels):
+    tc_dict = model_tca.get_tc(
+        "x",
+        forward_kwargs={"x": input.float().to(device)},
+        selected_output_node=node,
+        eval_max_output_node_only=False,
+        tc_idx_list=combs,
+        reduce_func=lambda x : x)  
+    data = pd.DataFrame({f"{labels[i]}":tc_dict[combs[i]].cpu().detach().numpy() for i in range(len(combs))})
+    # sorting dataframe with tca abs mean value
+    sorted_columns = np.abs(data).mean(axis=0).sort_values(ascending=False).index
+    sorted_df=data[sorted_columns].copy()
+    return sorted_df
+
+# construct tca dataframes
+tca_dfs = OrderedDict()
+node_list = [0,1,2]
+for i in node_list:
+    tca_dfs[CLASSES[i]] = DataframeConstruct(combinations, dataset_test.tensors[0], i, labels)
+
+
+for class_name, df in tca_dfs.items():
+    #df.to_csv(f"{output_dir}/{class_name}_tca.csv", index=False)
+    
+    mean_series = df.mean(axis=0)
+
+    mean_series.to_frame(name="mean").to_csv(f"{output_dir}/{class_name}_tca_mean_x{mass_x}_y{mass_y}.csv")
+
 print("Done!")
 
 
