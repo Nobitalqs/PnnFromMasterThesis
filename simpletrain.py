@@ -6,120 +6,182 @@ import awkward as ak
 import pandas as pd
 import numpy as np
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import TensorDataset, DataLoader
+from collections import OrderedDict
 from torchvision import datasets
 from torchvision.transforms import ToTensor
 from sklearn.model_selection import train_test_split
-
 import configs.classSets as classSets
-
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
 
-print(f"current pytorch version is {torch.__version__}")
+# List of input features that would be used for training
+SAMPLES = OrderedDict([
+    (
+        "ybb_htt",
+        [
+            "XToYHTo2B2Tau.root",
+        ],
+    ),
+    (
+        "ytt_hbb", 
+        [
+            "XToYHTo2Tau2B.root",
+        ],
+    ),
+    (
+        "tt_st",
+        [
+
+            "ttbar.root",
+            "ST.root",
+        ],
+    ),
+    (
+        "dy_h_tautau",
+        [
+            "HToTauTau.root",
+            "DYjets.root",
+        ],
+    ),
+    (
+        "misc",
+        [
+            "EWK.root",
+            "WJets.root",
+            "diboson.root",
+        ],
+    ),
+])
+
+TRAIN_SAMPLES = OrderedDict()
+TEST_SAMPLES = OrderedDict()
+for key, item in SAMPLES.items():
+        TRAIN_SAMPLES[key] = [os.path.join("/ceph/qli/nmssm_ml/05_03_2025_leftupper/preselection/2017/mt/even", i) for i in item]
+        TEST_SAMPLES[key] = [os.path.join("/ceph/qli/nmssm_ml/05_03_2025_leftupper/preselection/2017/mt/odd", i) for i in item]
+
+INPUT_FEATURES = [
+    "njets",
+    "nbtag",
+    #"nfatjets",
+    "pt_1",
+    "pt_2",
+    "eta_1",
+    #"phi_1",
+    "eta_2",
+    #"phi_2",
+    "deltaR_ditaupair",
+    "m_vis",
+    "m_fastmtt",
+    "pt_fastmtt",
+    "eta_fastmtt",
+    "phi_fastmtt",
+    "bpair_pt_1",
+    "bpair_eta_1",
+    "bpair_phi_1",
+    "bpair_btag_value_1",
+    "bpair_pt_2",
+    "bpair_eta_2",
+    "bpair_phi_2",
+    "bpair_btag_value_2",
+    "bpair_m_inv",
+    "bpair_deltaR",
+    "bpair_pt_dijet",
+    "fj_Xbb_pt",
+    "fj_Xbb_eta",
+    "fj_Xbb_phi",
+    "fj_Xbb_msoftdrop",
+    "fj_Xbb_nsubjettiness_2over1",
+    #"fj_Xbb_nsubjettiness_3over2", # has NaN values, due to wrong eta cut 
+    "met",
+    "metphi",
+    #"mass_tautaubb",
+    #"pt_tautaubb",
+    "kinfit_mX",
+    "kinfit_mY",
+    "kinfit_chi2",
+    "mt_1",
+    #"deltaPhi_met_tau1",
+    #"deltaPhi_met_tau2",
+    #"jpt_1",
+    #"jpt_2",
+    #"mjj",
+]
+
+CLASSES = list(SAMPLES.keys())
+
+def load_events(samples, classes, mass_x, mass_y):
+    data_frames = OrderedDict()
+    for key, value in samples.items():
+        events = uproot.concatenate({f: "ntuple" for f in value}, library="pd")
+        if key in ["ybb_htt", "ytt_hbb"]:
+            events = events.loc[(events["massX"] == mass_x) & (events["massY"] == mass_y)]
+        #events = events.loc[events["bpair_deltaR"] > 0.4]
+        events["label"] = classes.index(key)
+        data_frames[key] = events
+    return data_frames
+
+training_dataframes = load_events(TRAIN_SAMPLES, CLASSES, 280, 125)
+test_dataframes = load_events(TEST_SAMPLES, CLASSES, 280, 125)
 
 def weighted_cross_entropy(pred, target, weight):
     loss = F.cross_entropy(pred, target, reduction='none')
     return torch.sum(loss * weight)/torch.sum(weight)
 
-class DatasetProcessor:
-    def __init__(self, config):
-        self.config = config
-        self.label_dict = dict()
-
-    def _add_labels(self, df: pd.DataFrame, cl: str) -> pd.DataFrame:
-        if cl not in self.label_dict:
-            self.label_dict[cl] = len(self.label_dict)
-        else:
-            pass
-        df["label"] = self.label_dict[cl]
-        return df
-
-    def dataframe_split(self, class_dict, split: str) -> pd.DataFrame:
-        dfs = []
-        for cl in class_dict:
-            tmp_file_dict = {
-                os.path.join(
-                    "/ceph/qli/nmssm_ml/05_03_2025_leftupper/preselection/2017/mt/",
-                    split,
-                    file + ".root",
-                ): "ntuple"
-                for file in class_dict[cl]
-            }
-
-            events = uproot.concatenate(tmp_file_dict)
-            df = ak.to_dataframe(events)
-            df = self._add_labels(df, cl)
-            print(f"Number of events for {cl}: {df.shape[0]}")
-            df = df.reset_index(drop=True)
-            dfs.append(df)
-
-        return pd.concat(dfs, ignore_index=True)
-    
+def balance_samples(dfs):
+    sum_weights_all = sum([sum(df["weight"].values) for df in dfs.values()])
+    for output, df in dfs.items():
+        sum_weights_class = sum(df['weight'].values)
+        df["weight"] = df["weight"] * (sum_weights_all / (len(dfs) * sum_weights_class))
 
 
-def balance_samples(df_train,df_val,classes,label_dict):
-    sum_weights_all = sum(df_train["weight"].values) + sum(df_val["weight"].values)
-    for cl in classes:
-        mask_train = df_train["label"].isin([label_dict[cl]])
-        mask_val = df_val["label"].isin([label_dict[cl]])
-        sum_weights_class = sum(df_train.loc[mask_train, 'weight'].values) + sum(df_val.loc[mask_val, 'weight'].values)
-        df_train.loc[mask_train, "weight"] = df_train.loc[mask_train, "weight"] * (sum_weights_all / (len(classes) * sum_weights_class))
-        df_val.loc[mask_val, "weight"] = df_val.loc[mask_val, "weight"] * (sum_weights_all / (len(classes) * sum_weights_class))
+def create_dataset(data_frames, input_features, calculate_weights=True, mode="train"):
+    x, y, w, index = [], [], [], []
+    print(f"original samples:{data_frames}")
+    if calculate_weights:
+        balance_samples(data_frames)
+    print(f"weighted samples:{data_frames}")
+    for sample, data_frame in data_frames.items():
+        inputs = torch.from_numpy(data_frame[input_features].values).float()
+        inputs = (inputs - torch.mean(inputs, axis=0)) / torch.std(inputs, axis=0)
+        targets = torch.from_numpy(data_frame["label"].values).long()
+        weights = torch.from_numpy(data_frame["weight"].values).float()
+        df_index = torch.from_numpy(data_frame.index.values).long()
+        x.append(inputs)
+        y.append(targets)
+        w.append(weights)
+        index.append(df_index)
+
+    x = torch.cat(x, axis=0)
+    y = torch.cat(y, axis=0)
+    w = torch.cat(w, axis=0)
+    index = torch.cat(index, axis=0)
+
+    if mode == "train":
         
-        sum_weights_class_new = sum(df_train.loc[mask_train, 'weight'].values) + sum(df_val.loc[mask_val, 'weight'].values)
+        x_train, x_val, y_train, y_val, w_train, w_val, i_train, i_val = train_test_split(x, y, w, index, train_size=0.8, shuffle=True)
+        
+        return (
+        TensorDataset(x_train, y_train, w_train, i_train),
+        TensorDataset(x_val, y_val, w_val, i_val)
+        )
 
+    elif mode == "test":
+        
+        return (
+            TensorDataset(x, y, w, index)
+        )
 
-# Load configuration and classes
-with open("configs/neural_net.yaml", "r") as file:
-    config = yaml.load(file, yaml.FullLoader)
-class_dict = classSets.classes[config["classes"]]
-
-# Create processor instance
-processor = DatasetProcessor(config=config)
-
-# Training and test data
-df_train = processor.dataframe_split(class_dict, "even")
-# Train-validation split
-df_for_train, val_for_df = train_test_split(df_train, test_size=0.2, random_state=0)
-balance_samples(df_for_train,val_for_df,class_dict,processor.label_dict)
-
-df_test = processor.dataframe_split(class_dict, "odd")
-
-
-mask_train= ~((df_for_train["label"].isin([0, 1]))) | ((df_for_train["massX"] == 280) & (df_for_train["massY"] == 125))
-mask_val= ~((val_for_df["label"].isin([0, 1]))) | ((val_for_df["massX"] == 280) & (val_for_df["massY"] == 125))
-mask_test= ~((df_test["label"].isin([0, 1]))) | ((df_test["massX"] == 280) & (df_test["massY"] == 125))
-df_for_train = df_for_train[mask_train]
-val_for_df = val_for_df[mask_val]
-df_test = df_test[mask_test]
-
-for i in df_for_train.columns:
-    if df_for_train[i].isna().any():
-        df_for_train.drop(columns=i, inplace=True)
-        val_for_df.drop(columns=i, inplace=True)
-        df_test.drop(columns=i, inplace=True)
-
-# Transfer dataframe as Tensor
-class MyDataset():
-    def __init__(self, dataframe):
-        self.X = dataframe.drop(columns=["massX", "massY", "label", "weight"]).values.astype("float32")
-        self.y = dataframe["label"].values.astype("int64")
-        self.w = dataframe["weight"].to_numpy(dtype=np.float32)
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return torch.tensor(self.X[idx]), torch.tensor(self.y[idx]), torch.tensor(self.w[idx])
+dataset_train, dataset_val = create_dataset(training_dataframes, INPUT_FEATURES, calculate_weights=True, mode="train")
+dataset_test = create_dataset(test_dataframes, INPUT_FEATURES, calculate_weights=True, mode="test")
 
 
 # Create data loader
-training_dataloader = DataLoader(MyDataset(df_for_train),batch_size=5000,shuffle=True)
-val_dataloader = DataLoader(MyDataset(val_for_df),batch_size=5000,shuffle=True)
-test_dataloader = DataLoader(MyDataset(df_test),batch_size=5000,shuffle=True)
+training_dataloader = DataLoader(dataset_train,batch_size=1024,shuffle=True, num_workers=4)
+val_dataloader = DataLoader(dataset_val,batch_size=1024,shuffle=False, num_workers=4)
+test_dataloader = DataLoader(dataset_test,batch_size=1024,shuffle=False, num_workers=4)
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -129,13 +191,16 @@ class SimpleNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.linear_relu_stack = nn.Sequential(
-            nn.Linear(37,500),
-            nn.ReLU(),
-            nn.Linear(500,500),
-            nn.ReLU(),
-            nn.Linear(500,300),
-            nn.ReLU(),
-            nn.Linear(300,5)
+            nn.Linear(len(INPUT_FEATURES),200),
+            nn.Tanh(),
+            nn.BatchNorm1d(200),
+            nn.Linear(200,200),
+            nn.Tanh(),
+            nn.BatchNorm1d(200),
+            nn.Linear(200,200),
+            nn.Tanh(),
+            nn.BatchNorm1d(200),
+            nn.Linear(200,5)
         )
 
     def forward(self,x):
@@ -143,13 +208,13 @@ class SimpleNN(nn.Module):
 
 model = SimpleNN().to(device)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=0.001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.01)
 
 def train(dataloader,model,optimizer):
     size = len(dataloader.dataset)
-    model.train()
-    for batch,(X,y,w) in enumerate(dataloader):
-        X,y = X.to(device),y.to(device)
+    model = model.train()
+    for batch,(X,y,w,index) in enumerate(dataloader):
+        X,y,w = X.to(device),y.to(device),w.to(device)
         pred = model(X)
         loss = weighted_cross_entropy(pred, y, w)
         loss.backward()
@@ -165,13 +230,13 @@ def test(dataloader,model,show_confusion=False):
     all_preds = []
     all_labels = []
     with torch.no_grad():
-        for X, y, w in dataloader:
-            X, y = X.to(device), y.to(device)
+        for X, y, w, index in dataloader:
+            X,y,w = X.to(device),y.to(device),w.to(device)
             pred = model(X)
             test_loss += weighted_cross_entropy(pred, y, w).item()
             correct += (pred.argmax(1) == y).type(torch.float).sum().item()
 
-            all_preds.extend(pred.argmax(1).cpu().numpy())
+            all_preds.extend(torch.argmax(torch.softmax(pred, dim=1), dim=1).cpu().numpy())
             all_labels.extend(y.cpu().numpy())
 
     test_loss /= num_batches
@@ -183,23 +248,23 @@ def test(dataloader,model,show_confusion=False):
         disp = ConfusionMatrixDisplay(confusion_matrix=cm)
         disp.plot(cmap="Blues")
         plt.title("Confusion Matrix")
-        plt.show()
+        plt.savefig("confusion_matrix.png", dpi=300, bbox_inches='tight')
 
-epochs = 1500
+epochs = 60
 for t in range(epochs):
     print(f"Epoch {t+1}\n-------------------------------")
     train(training_dataloader, model, optimizer)
     if t == (epochs -1):
-        test(test_dataloader, model, show_confusion=True)
+        test(training_dataloader, model, show_confusion=True)
     else:
-        test(test_dataloader, model)
+        test(training_dataloader, model)
 print("Done!")
 
 
-torch.save(model.state_dict(), "SimpleNN.pth")
-print("Saved PyTorch Model State to SimpleNN.pth")
+# torch.save(model.state_dict(), "SimpleNN.pth")
+# print("Saved PyTorch Model State to SimpleNN.pth")
 
-model = SimpleNN().to(device)
-model.load_state_dict(torch.load("SimpleNN.pth", weights_only=True))
+# model = SimpleNN().to(device)
+# model.load_state_dict(torch.load("SimpleNN.pth", weights_only=True))
 
 
